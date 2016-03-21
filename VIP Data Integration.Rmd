@@ -1,0 +1,164 @@
+---
+title: "VIP data integration: merge 'Addresses' and 'Precinct Polling List' documents into a single table"
+author: "Rachel Stephens"
+date: "January 15, 2016"
+output: html_document
+---
+
+```{r, echo = FALSE}
+setwd("/Users/rachelstephens/Dropbox/Work Documents/Career Search/Democracy Works")
+```
+
+Import necessary packages:
+
+```{r import libraries, message = FALSE}
+library(stringr)
+library(dplyr)
+```
+
+## 1. Load address data
+The first step is to load in data from the addresses.csv file.
+
+```{r import address data}
+addresses <- read.csv("addresses.csv", stringsAsFactors = FALSE, sep = ",")
+str(addresses)
+
+```
+
+## 2. Load precinct polling data
+Next, we need to load in the precinct_polling_list.csv file. This is less straightforward, as some observations are erroneously formatted and are not properly separated by commas. 
+
+Instead of loading data directly into a data frame, we are going to read the data as a single character vector. This will allow us to easily manipulate the data up front. After it is corrected we will import the data into a table in the next step.
+
+This correction process is a combination of automated and manual work. We will use systematic logic to locate errors and manual work to correct them (by adding commas in the correct places.) Eventually it would be possible to use regular expressions to build an automated way to also handle exceptions, but at this point we are opting for a quicker process of correcting exceptions by hand.
+
+At this point we are also going to split the state and zip code data into separate columns.
+
+```{r import precinct data}
+# load data into a character vector
+tempPrecincts <- readLines("precinct_polling_list.csv")
+
+# determine the number of column separators that should be present for each observation, based on the header
+breaks <- str_count(string = head(tempPrecincts, 1), pattern = ",")
+
+# count the number of commas in each row
+countComma <- str_count(string = tempPrecincts, pattern = ",")
+
+# return the rows that do not have the appropriate number of commas, then subset the data based on these values
+errorPositions <- which(countComma != breaks)
+tempPrecincts[errorPositions]
+
+# copy results of above errors, and manually correct comma errors. corrections should be concatenated into a single string.
+corrections <- c(
+    "974 Great Plain Avenue,Needham,MA 02492,USA,MAS-006",
+    "29 Godwin Avenue,Ridgewood,NJ 07450,USA,NEWJ-000",
+    "1782 Massachusetts Ave,Cambridge,MA 02140,USA,MAS-070",
+    "2035 East North Avenue,Milwaukee,WI 53211,USA,WIS-067")
+
+# remove errorneous rows from the data
+tempPrecincts <- tempPrecincts[-errorPositions]
+
+# append the corrected precincts to the data
+tempPrecincts <- append(tempPrecincts, corrections)
+
+# split state and ZIP
+tempPrecincts <- gsub("([[:alpha:]]{2}) ([[:digit:]]{5})", "\\1,\\2", tempPrecincts)
+tempPrecincts <- gsub("State/ZIP", "State,ZIP", tempPrecincts)
+```
+
+## 4. Create precinct polling data frame
+
+Now we have the ability to convert the precinct polling data into a data frame. 
+
+``` {r create precinct dataframe}
+# initialize data frame
+precincts <- data.frame(do.call(rbind, strsplit(x = tempPrecincts, split = ",")))
+
+# set column classes
+precincts <- data.frame(lapply(precincts, as.character), stringsAsFactors = FALSE)
+
+# extract column names
+columns <- precincts[1, ]
+
+# add "Polling." so column names for voter addresses and polling addresses will be clear when data is merged
+columns <- paste("Polling.", columns, sep = "") 
+
+# set data frame header
+colnames(precincts) <- columns
+
+# remove header row as an observation
+precincts <- precincts[-1, ]
+
+str(precincts)
+```
+
+## 5. Adjust Precinct IDs
+
+To merge the address and precinct data, we need a set of common foreign keys. To accomplish this, we need to make a few transformations on the Precinct ID to get the data in the same format in both tables. 
+
+The address data uses a `###-###` format, while the precinct polling data uses a `xxx(x)-###` format. 
+
+The first `###` in the address data corresponds to a numeric state code (though there is one instance where a single state has multiple numeric codes; based on the other data in our sample, we are treating this anomaly as an error that needs to be corrected.) 
+
+The `xxx(x)` in the precinct data is the first three (or four) letters in the state name. 
+
+To create a consistent foreign key across the two data sets, we are going to split the precinct ID on the dash, and then combine it with the state abbreviation. Without more knowledge about the use cases for the precinct ID variations across the data sets, it is safer to create a unique method to join the data and leave the original IDs intact (rather than potentially breaking dependencies that may exist outside this data set by overwriting one of the precinct ID variations to conform to the other.)
+
+In addition, we need to make sure that all `###` secondary strings in the precinct polling location list are fully comprised of three numbers, as in some instances a leading zero is shown as a dash.
+
+``` {r precint IDs}
+# split precinct IDs for address data
+addresses <- mutate(addresses, ID = gsub("([[:digit:]]{3})-([[:digit:]]{3})", "\\2", addresses$Precinct.ID))
+
+# merge state and ID for address data
+addresses$ID <- paste(addresses$State, addresses$ID)
+
+# make sure leading zeros in precinct ID correctly display as a zero (not a dash)
+precincts$Polling.Precinct <- gsub("--", "-0", precincts$Polling.Precinct)
+
+# split precinct IDs for precinct polling location data
+precincts$ID <- str_extract(precincts$Polling.Precinct, "([[:digit:]]{3})")
+
+# merge state and ID for precinct data
+precincts$ID <- paste(precincts$Polling.State, precincts$ID)
+```
+
+## 6. Merge tables
+
+All that work comes together! Now it's time to merge the tables based on the newly formed ID variable. 
+
+``` {r merge tables}
+# merge data
+mergedData <- merge(addresses, precincts)
+
+str(mergedData)
+```
+
+Now we compare our revised data set to our original data sets.  
+* Addresses: `r nrow(addresses)` observations  
+* Precinct Polling: `r nrow(precincts)` observations  
+* Merged Data: `r nrow(mergedData)` observations
+
+Let's explore the source of the discrepancies:
+
+``` {r data discrepancies}
+# address ID's that are not present in the merged data (meaning we are missing matching precinct IDs for these addresses)
+addresses$ID[!addresses$ID %in% mergedData$ID]
+
+# precinct IDs that are not present in the merged data (meaning we have precinct locations with no corresponding addresses)
+precincts$ID[!precincts$ID %in% mergedData$ID]
+```
+
+This shows that our data is not complete. Probably most concerning is having addresses without corresponding precincts, as this indicates that there are voters without a precinct polling location. 
+
+``` {r export data}
+# export data
+write.table(mergedData, "Merged_Data.txt")
+write.table(precincts, "Precinct_Data.txt")
+write.table(addresses, "Address_Data.txt")
+
+# display results
+# NOTE the line numbers, as the columns below may wrap for display purposes
+mergedData
+```
+
